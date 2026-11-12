@@ -10,6 +10,8 @@ const STATIC_ASSETS = [
   './src/app.js',
   './favicon.svg',
   './manifest.json',
+  './icon-48.png',
+  './icon-96.png',
   './icon-192.png',
   './icon-512.png'
 ];
