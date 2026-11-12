@@ -1,9 +1,12 @@
+// @ts-nocheck
+/// <reference lib="webworker" />
 // MEDIC Service Worker - Offline-First Health App Shell Cache
-const CACHE_NAME = 'medic-pwa-v1';
+const CACHE_NAME = 'medic-pwa-v2';
 
 const STATIC_ASSETS = [
   './',
   './index.html',
+  './src/app.js',
   './favicon.svg',
   './manifest.json',
   './icon-192.png',
@@ -34,7 +37,7 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// Fetch: Network-First with Cache Fallback for HTML/data, Cache-First for static assets
+// Fetch: Network-First with Cache Fallback for HTML/data
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   const url = new URL(req.url);
@@ -45,7 +48,6 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     fetch(req)
       .then((networkRes) => {
-        // If valid network response, clone into cache for offline use
         if (networkRes && networkRes.status === 200) {
           const resClone = networkRes.clone();
           caches.open(CACHE_NAME).then((cache) => {
@@ -55,10 +57,8 @@ self.addEventListener('fetch', (event) => {
         return networkRes;
       })
       .catch(() => {
-        // Offline fallback: serve from cache
         return caches.match(req).then((cachedRes) => {
           if (cachedRes) return cachedRes;
-          // If request was for a navigation, return index.html
           if (req.mode === 'navigate') {
             return caches.match('./index.html') || caches.match('./');
           }

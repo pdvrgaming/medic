@@ -96,7 +96,7 @@
       Family Medicine Routine &amp; Stock Guardian for Indian Households
     </text>
     <text x="0" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="500" font-size="15" fill="#99F6E4" opacity="0.9">
-      NLEM &amp; CDSCO Healthcare Standards • Natural Aarti Voice TTS • 1-Tap WhatsApp Refill
+      PMBJP Jan Aushadhi &amp; NLEM • Dose Calendar • Natural Aarti Voice • PDVR Gaming
     </text>
   </g>
 
@@ -108,10 +108,10 @@
       <text x="85" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="13" font-weight="700" fill="#FFFFFF">⚡ 100% Offline PWA</text>
     </g>
 
-    <!-- Badge 2: NLEM Standards -->
+    <!-- Badge 2: NLEM & PMBJP Standards -->
     <g transform="translate(185, 0)">
       <rect width="185" height="42" rx="12" fill="#134E4A" stroke="#14B8A6" stroke-width="1.5" />
-      <text x="92" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="13" font-weight="700" fill="#FFFFFF">💊 112+ NLEM Meds</text>
+      <text x="92" y="26" text-anchor="middle" font-family="-apple-system, sans-serif" font-size="13" font-weight="700" fill="#FFFFFF">💊 145+ NLEM/PMBJP</text>
     </g>
 
     <!-- Badge 3: Voice Reading -->
@@ -133,3 +133,4 @@
     </g>
   </g>
 </svg>
+
