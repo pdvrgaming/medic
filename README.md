@@ -58,7 +58,7 @@
     </tr>
     <tr>
       <td><strong>Storage Engine</strong></td>
-      <td>100% Client-Side W3C IndexedDB (16 Atomic Object Stores, Zero Remote Cloud)</td>
+      <td>100% Client-Side W3C IndexedDB (16 Atomic Object Stores; Optional Online OpenFDA Fallback)</td>
     </tr>
     <tr>
       <td><strong>Formulary Standards</strong></td>

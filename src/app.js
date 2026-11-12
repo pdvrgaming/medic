@@ -422,6 +422,31 @@
       return `${y}-${m}-${d}`;
     }
 
+    // Local-date key for "today" (never use toISOString for dates: it is UTC and
+    // rolls over at 05:30 AM in India instead of midnight).
+    function todayDateKey() {
+      return formatDateKey(new Date());
+    }
+
+    // Escape user/external text before putting it into innerHTML templates.
+    function escapeHtml(value) {
+      return String(value === undefined || value === null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // "08:00 AM" -> minutes since midnight, for correct chronological sorting.
+    function timeSlotToMinutes(slot) {
+      const m = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec((slot || '').trim());
+      if (!m) return 24 * 60 + 1; // "As Needed" etc. go last
+      let h = Number(m[1]) % 12;
+      if (m[3].toUpperCase() === 'PM') h += 12;
+      return h * 60 + Number(m[2]);
+    }
+
     // --- Custom UI Confirmation Modal Helper ---
     function customConfirm(title, message) {
       return new Promise((resolve) => {
@@ -1026,7 +1051,7 @@
 
     // --- COMPUTE TODAY'S DOSES ---
     async function computeTodayDoses() {
-      const todayStr = new Date().toISOString().split('T')[0];
+      const todayStr = todayDateKey();
       const doseHistory = await dbGetAll('DoseHistory');
       const historyMap = {};
       doseHistory.filter(d => d.dateKey === todayStr).forEach(d => {
@@ -1060,13 +1085,13 @@
         });
       });
 
-      list.sort((a, b) => a.timeSlot.localeCompare(b.timeSlot));
+      list.sort((a, b) => timeSlotToMinutes(a.timeSlot) - timeSlotToMinutes(b.timeSlot));
       AppState.todayDoses = list;
     }
 
     // --- TRANSACTIONAL DOSE RECORDING ---
     async function recordDoseStatus(medicineId, timeSlot, newStatus) {
-      const todayStr = new Date().toISOString().split('T')[0];
+      const todayStr = todayDateKey();
       const doseKey = `${medicineId}_${timeSlot}_${todayStr}`;
 
       return new Promise((resolve, reject) => {
@@ -1084,6 +1109,7 @@
           doseStore.put({
             id: doseKey,
             medicineId,
+            memberId: (AppState.medicines.find(m => m.id === medicineId) || {}).memberId,
             timeSlot,
             dateKey: todayStr,
             status: newStatus,
@@ -1157,7 +1183,10 @@
         const doses = [];
 
         activeMeds.forEach(med => {
+          const medStartKey = med.createdDate ? formatDateKey(new Date(med.createdDate)) : '0000-00-00';
+          if (dateKey < medStartKey) return; // medicine did not exist yet
           (med.schedules || []).forEach(slot => {
+            if (slot === 'As Needed') return; // PRN doses are not part of adherence
             const hist = historyMap[`${dateKey}_${med.id}_${slot}`];
             const member = AppState.members.find(m => m.id === med.memberId);
             doses.push({
@@ -1176,6 +1205,8 @@
             });
           });
         });
+
+        doses.sort((a, b) => timeSlotToMinutes(a.timeSlot) - timeSlotToMinutes(b.timeSlot));
 
         const scheduled = doses.length;
         const taken = doses.filter(d => d.status === 'TAKEN').length;
@@ -1226,6 +1257,8 @@
           if (st.scheduled > 0) {
             if (st.compliance === 'FULL') {
               streak++;
+            } else if (cKey === todayKey) {
+              // today is still in progress: don't break the streak yet
             } else {
               break;
             }
@@ -1423,9 +1456,9 @@
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0 flex-1 space-y-1">
               <div class="flex items-center gap-1.5 flex-wrap">
-                <span class="font-bold text-sm text-charcoal truncate">${dose.medicineName}</span>
+                <span class="font-bold text-sm text-charcoal truncate">${escapeHtml(dose.medicineName)}</span>
                 <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-white border border-surface-border text-charcoal-muted">${dose.strength || ''}</span>
-                <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-teal-subtle text-teal-primary">${dose.memberName}</span>
+                <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-teal-subtle text-teal-primary">${escapeHtml(dose.memberName)}</span>
               </div>
               <div class="text-xs text-charcoal-muted flex items-center gap-1.5 flex-wrap">
                 <span>${localizeTimeSlot(dose.timeSlot, lang)}</span>
@@ -1509,6 +1542,33 @@
     }
 
     // --- TRANSACTIONAL PURCHASE RECORDING & EDITING ---
+    // Apply net stock changes (one read+write per medicine, so two lines for the same
+    // medicine can never overwrite each other) inside an already-open transaction.
+    function applyStockDeltas(invStore, medStore, deltas, householdId, purchaseInfo) {
+      Object.keys(deltas).forEach(medicineId => {
+        const invReq = invStore.get(medicineId);
+        invReq.onsuccess = () => {
+          const inv = invReq.result || { medicineId, householdId, currentQuantity: 0 };
+          inv.currentQuantity = Math.max(0, (inv.currentQuantity || 0) + deltas[medicineId]);
+          inv.lastUpdated = new Date().toISOString();
+          if (purchaseInfo && purchaseInfo[medicineId]) {
+            inv.lastPurchaseDate = purchaseInfo[medicineId].date;
+            inv.lastPurchasePrice = purchaseInfo[medicineId].price;
+          }
+          invStore.put(inv);
+
+          const medReq = medStore.get(medicineId);
+          medReq.onsuccess = () => {
+            const med = medReq.result;
+            if (med) {
+              med.currentStock = inv.currentQuantity;
+              medStore.put(med);
+            }
+          };
+        };
+      });
+    }
+
     async function savePurchaseTransactional(purchaseData, itemsList, isEdit = false) {
       if (AppState.activeRole === 'FAMILY_MEMBER') {
         showToast('Family Members (View Mode) cannot record purchases', 'warning');
@@ -1521,37 +1581,30 @@
         const invStore = tx.objectStore('MedicineInventory');
         const medStore = tx.objectStore('MemberMedicines');
 
-        // Put purchase header
+        const deltas = {};
+        const purchaseInfo = {};
+
+        // When editing: remove the old line items and reverse their stock first,
+        // so changed quantities / removed lines leave stock correct.
+        if (isEdit) {
+          const old = AppState.purchases.find(p => p.id === purchaseData.id);
+          (old && old.items ? old.items : []).forEach(it => {
+            itemStore.delete(it.id);
+            if (it.medicineId) deltas[it.medicineId] = (deltas[it.medicineId] || 0) - Number(it.quantity || 0);
+          });
+        }
+
         purStore.put(purchaseData);
 
-        // Put purchase items and update inventory
         for (const item of itemsList) {
           itemStore.put(item);
-
-          if (item.medicineId && !isEdit) {
-            const invReq = invStore.get(item.medicineId);
-            invReq.onsuccess = () => {
-              let inv = invReq.result || {
-                medicineId: item.medicineId,
-                householdId: purchaseData.householdId,
-                currentQuantity: 0
-              };
-              inv.currentQuantity = (inv.currentQuantity || 0) + Number(item.quantity || 0);
-              inv.lastPurchaseDate = purchaseData.date;
-              inv.lastPurchasePrice = Number(item.price || 0);
-              invStore.put(inv);
-
-              const medReq = medStore.get(item.medicineId);
-              medReq.onsuccess = () => {
-                const med = medReq.result;
-                if (med) {
-                  med.currentStock = inv.currentQuantity;
-                  medStore.put(med);
-                }
-              };
-            };
+          if (item.medicineId) {
+            deltas[item.medicineId] = (deltas[item.medicineId] || 0) + Number(item.quantity || 0);
+            purchaseInfo[item.medicineId] = { date: purchaseData.date, price: Number(item.price || 0) };
           }
         }
+
+        applyStockDeltas(invStore, medStore, deltas, purchaseData.householdId, purchaseInfo);
 
         tx.oncomplete = async () => {
           triggerHaptic('success');
@@ -1559,6 +1612,7 @@
           resolve(true);
         };
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
       });
     }
 
@@ -1575,32 +1629,15 @@
         const invStore = tx.objectStore('MedicineInventory');
         const medStore = tx.objectStore('MemberMedicines');
 
+        const deltas = {};
         const pur = AppState.purchases.find(p => p.id === purchaseId);
         if (pur && pur.items) {
           pur.items.forEach(it => {
-            if (it.medicineId) {
-              const invReq = invStore.get(it.medicineId);
-              invReq.onsuccess = () => {
-                const inv = invReq.result;
-                if (inv) {
-                  inv.currentQuantity = Math.max(0, (inv.currentQuantity || 0) - Number(it.quantity || 0));
-                  invStore.put(inv);
-
-                  const medReq = medStore.get(it.medicineId);
-                  medReq.onsuccess = () => {
-                    const med = medReq.result;
-                    if (med) {
-                      med.currentStock = inv.currentQuantity;
-                      medStore.put(med);
-                    }
-                  };
-                }
-              };
-            }
+            if (it.medicineId) deltas[it.medicineId] = (deltas[it.medicineId] || 0) - Number(it.quantity || 0);
             itemStore.delete(it.id);
           });
         }
-
+        applyStockDeltas(invStore, medStore, deltas, pur ? pur.householdId : null, null);
         purStore.delete(purchaseId);
 
         tx.oncomplete = async () => {
@@ -1609,6 +1646,7 @@
           resolve(true);
         };
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
       });
     }
 
@@ -1773,9 +1811,9 @@
             <div class="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
               <i data-lucide="alert-circle" class="w-4 h-4 text-status-warning shrink-0"></i>
               <div class="min-w-0">
-                <div class="font-bold text-charcoal truncate">${med.brand}</div>
+                <div class="font-bold text-charcoal truncate">${escapeHtml(med.brand)}</div>
                 <div class="text-charcoal-muted flex items-center gap-1.5 mt-0.5">
-                  <span class="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded text-[10px] font-bold">${mem ? mem.name : 'Family'}</span>
+                  <span class="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded text-[10px] font-bold">${escapeHtml(mem ? mem.name : 'Family')}</span>
                   <span>${med.currentStock} left (~${daysLeft}d)</span>
                 </div>
               </div>
@@ -1803,13 +1841,13 @@
             <div class="space-y-1 min-w-0 flex-1">
               <div class="inline-flex items-center gap-1.5 bg-white/25 px-2.5 py-0.5 rounded-full text-xs font-bold tracking-wide">
                 <i data-lucide="user" class="w-3.5 h-3.5 shrink-0"></i>
-                <span class="truncate">${next.memberName}</span>
+                <span class="truncate">${escapeHtml(next.memberName)}</span>
               </div>
               <div class="flex items-center gap-2 mt-1 min-w-0">
-                <div class="text-xl font-bold leading-tight break-words">${next.medicineName}</div>
+                <div class="text-xl font-bold leading-tight break-words">${escapeHtml(next.medicineName)}</div>
                 <button class="speak-dose-btn p-1.5 bg-white/20 hover:bg-white/30 rounded-lg text-white touch-target flex items-center justify-center shrink-0" 
                   title="Listen to medicine instructions" 
-                  data-medname="${next.medicineName}" 
+                  data-medname="${escapeHtml(next.medicineName)}" 
                   data-strength="${next.strength || ''}" 
                   data-dose="${next.unitsPerDose} ${next.dosageForm}" 
                   data-time="${next.timeSlot}" 
@@ -1862,16 +1900,16 @@
               <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-1.5">
                   <span class="px-2 py-0.5 rounded-md bg-teal-subtle text-teal-dark font-bold text-[11px] tracking-wide shrink-0">
-                    ${dose.memberName}
+                    ${escapeHtml(dose.memberName)}
                   </span>
                   <span class="text-xs font-semibold text-charcoal-muted">(${localizeFoodTiming(dose.foodTiming, AppState.settings.language)})</span>
                 </div>
                 <div class="font-bold text-sm text-charcoal mt-1 flex items-center gap-1.5 flex-wrap">
-                  <span class="break-words leading-snug">${dose.medicineName}</span>
+                  <span class="break-words leading-snug">${escapeHtml(dose.medicineName)}</span>
                   <span class="text-xs font-normal text-charcoal-muted shrink-0">${dose.strength}</span>
                   <button class="speak-dose-btn p-1 text-teal-primary hover:bg-teal-subtle rounded-md touch-target shrink-0" 
                     title="Listen to medicine instructions" 
-                    data-medname="${dose.medicineName}" 
+                    data-medname="${escapeHtml(dose.medicineName)}" 
                     data-strength="${dose.strength || ''}" 
                     data-dose="${dose.unitsPerDose} ${dose.dosageForm}" 
                     data-time="${dose.timeSlot}" 
@@ -1921,12 +1959,12 @@
         card.innerHTML = `
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 rounded-full bg-teal-subtle text-teal-primary font-bold flex items-center justify-center text-sm">
-              ${m.name[0]}
+              ${escapeHtml(m.name ? m.name[0] : '?')}
             </div>
             <div>
-              <div class="font-bold text-sm text-charcoal">${m.name}</div>
-              <div class="text-xs text-charcoal-muted">${m.relation} • ${m.age || '--'} yrs</div>
-              <div class="text-[11px] text-teal-dark mt-0.5">${m.conditions || 'No conditions listed'}</div>
+              <div class="font-bold text-sm text-charcoal">${escapeHtml(m.name)}</div>
+              <div class="text-xs text-charcoal-muted">${escapeHtml(m.relation)} • ${escapeHtml(m.age || '--')} yrs</div>
+              <div class="text-[11px] text-teal-dark mt-0.5">${escapeHtml(m.conditions || 'No conditions listed')}</div>
             </div>
           </div>
           <div class="flex items-center gap-2">
@@ -2027,13 +2065,13 @@
           <div class="flex items-start justify-between">
             <div>
               <div class="font-bold text-base text-charcoal flex items-center gap-1.5">
-                ${med.brand}
-                <span class="text-xs font-normal text-charcoal-muted">(${med.strength})</span>
+                ${escapeHtml(med.brand)}
+                <span class="text-xs font-normal text-charcoal-muted">(${escapeHtml(med.strength)})</span>
               </div>
-              <div class="text-xs text-charcoal-muted">${med.generic || ''} • ${med.dosageForm}</div>
+              <div class="text-xs text-charcoal-muted">${escapeHtml(med.generic || '')} • ${escapeHtml(med.dosageForm)}</div>
               <div class="text-[11px] font-bold text-teal-dark mt-1 flex items-center gap-1 flex-wrap">
-                <span class="bg-teal-subtle px-2 py-0.5 rounded">${member ? member.name : 'Family'}</span>
-                <span class="text-charcoal-muted font-normal">• ${med.category}</span>
+                <span class="bg-teal-subtle px-2 py-0.5 rounded">${escapeHtml(member ? member.name : 'Family')}</span>
+                <span class="text-charcoal-muted font-normal">• ${escapeHtml(med.category)}</span>
               </div>
             </div>
             <button class="med-detail-btn p-2 text-charcoal-muted hover:bg-surface-subtle rounded-lg touch-target" data-medid="${med.id}">
@@ -2075,7 +2113,7 @@
     function renderPurchasesScreen() {
       let thisMonthTotal = 0;
       let allTimeTotal = 0;
-      const curMonth = new Date().toISOString().slice(0, 7);
+      const curMonth = todayDateKey().slice(0, 7);
 
       AppState.purchases.forEach(p => {
         const amt = Number(p.totalAmount || 0);
@@ -2108,8 +2146,8 @@
         card.innerHTML = `
           <div class="flex items-start justify-between">
             <div>
-              <div class="text-xs font-semibold text-charcoal-muted">${p.date} • ${p.paymentMode || 'Cash'}</div>
-              <div class="font-bold text-sm text-charcoal">${p.pharmacy || 'Chemist Store'}</div>
+              <div class="text-xs font-semibold text-charcoal-muted">${escapeHtml(p.date)} • ${escapeHtml(p.paymentMode || 'Cash')}</div>
+              <div class="font-bold text-sm text-charcoal">${escapeHtml(p.pharmacy || 'Chemist Store')}</div>
             </div>
             <div class="flex items-center gap-2">
               <div class="text-base font-bold text-teal-primary">₹${p.totalAmount}</div>
@@ -2125,13 +2163,13 @@
           <div class="divide-y divide-surface-border pt-1">
             ${items.map(it => `
               <div class="py-1.5 flex items-center justify-between text-xs">
-                <span class="text-charcoal font-medium">${it.medicineName} (${it.quantity} units)</span>
+                <span class="text-charcoal font-medium">${escapeHtml(it.medicineName)} (${escapeHtml(it.quantity)} units)</span>
                 <span class="text-charcoal-muted font-semibold">₹${it.price}</span>
               </div>
             `).join('')}
           </div>
 
-          ${p.notes ? `<div class="text-[11px] text-charcoal-muted bg-surface p-2 rounded-lg">${p.notes}</div>` : ''}
+          ${p.notes ? `<div class="text-[11px] text-charcoal-muted bg-surface p-2 rounded-lg">${escapeHtml(p.notes)}</div>` : ''}
         `;
         list.appendChild(card);
       });
@@ -2151,7 +2189,7 @@
           <select class="p-item-med w-2/3 bg-white border border-surface-border rounded-lg px-2 py-1.5 text-xs font-semibold">
             <option value="">Select Prescribed Medicine...</option>
             ${AppState.medicines.map(m => `
-              <option value="${m.id}" ${m.id === prefillMedId ? 'selected' : ''}>${m.brand} (${m.strength})</option>
+              <option value="${m.id}" ${m.id === prefillMedId ? 'selected' : ''}>${escapeHtml(m.brand)} (${escapeHtml(m.strength)})</option>
             `).join('')}
           </select>
           <button type="button" class="remove-p-row text-charcoal-muted hover:text-status-danger p-1">
@@ -2425,7 +2463,7 @@
       if (autofillBadge) autofillBadge.classList.add('hidden');
 
       memberSelect.innerHTML = AppState.members.map(m => `
-        <option value="${m.id}" ${AppState.activeMemberId === m.id ? 'selected' : ''}>${m.name} (${m.relation})</option>
+        <option value="${m.id}" ${AppState.activeMemberId === m.id ? 'selected' : ''}>${escapeHtml(m.name)} (${escapeHtml(m.relation)})</option>
       `).join('');
 
       // Auto-detect member diagnosed health condition when selecting member
@@ -2537,15 +2575,15 @@
           const bName = item.brand;
           const gName = item.generic || '';
           const matchIdx = qLower ? bName.toLowerCase().indexOf(qLower) : -1;
-          let brandHtml = bName;
+          let brandHtml = escapeHtml(bName);
           if (matchIdx !== -1) {
-            brandHtml = `${bName.substring(0, matchIdx)}<span class="text-teal-primary font-extrabold underline">${bName.substring(matchIdx, matchIdx + qLower.length)}</span>${bName.substring(matchIdx + qLower.length)}`;
+            brandHtml = `${escapeHtml(bName.substring(0, matchIdx))}<span class="text-teal-primary font-extrabold underline">${escapeHtml(bName.substring(matchIdx, matchIdx + qLower.length))}</span>${escapeHtml(bName.substring(matchIdx + qLower.length))}`;
           }
 
           const genMatchIdx = qLower ? gName.toLowerCase().indexOf(qLower) : -1;
-          let genericHtml = gName;
+          let genericHtml = escapeHtml(gName);
           if (genMatchIdx !== -1) {
-            genericHtml = `${gName.substring(0, genMatchIdx)}<span class="text-teal-primary font-bold underline">${gName.substring(genMatchIdx, genMatchIdx + qLower.length)}</span>${gName.substring(genMatchIdx + qLower.length)}`;
+            genericHtml = `${escapeHtml(gName.substring(0, genMatchIdx))}<span class="text-teal-primary font-bold underline">${escapeHtml(gName.substring(genMatchIdx, genMatchIdx + qLower.length))}</span>${escapeHtml(gName.substring(genMatchIdx + qLower.length))}`;
           }
 
           const badgeClass = item.isGeneric 
@@ -2565,16 +2603,16 @@
               <div class="space-y-0.5 flex-1 pr-2">
                 <div class="flex items-center gap-2 flex-wrap">
                   <span class="font-bold text-sm text-charcoal">${brandHtml}</span>
-                  <span class="text-[11px] font-semibold text-teal-dark bg-teal-subtle px-1.5 py-0.5 rounded">${item.strength || ''}</span>
-                  <span class="text-[10px] uppercase font-bold text-charcoal-muted border border-surface-border px-1.5 py-0.2 rounded">${item.form || 'Tab'}</span>
+                  <span class="text-[11px] font-semibold text-teal-dark bg-teal-subtle px-1.5 py-0.5 rounded">${escapeHtml(item.strength || '')}</span>
+                  <span class="text-[10px] uppercase font-bold text-charcoal-muted border border-surface-border px-1.5 py-0.2 rounded">${escapeHtml(item.form || 'Tab')}</span>
                   <span class="text-[10px] font-semibold px-1.5 py-0.2 rounded ${badgeClass}">${badgeLabel}</span>
                 </div>
                 <div class="text-xs text-charcoal-muted truncate">
-                  <span class="font-medium text-charcoal">${genericHtml}</span> • ${item.mfr}
+                  <span class="font-medium text-charcoal">${genericHtml}</span> • ${escapeHtml(item.mfr)}
                 </div>
                 <div class="text-[10px] text-teal-primary font-medium flex items-center gap-1 mt-0.5">
                   <i data-lucide="shield-check" class="w-3 h-3"></i>
-                  <span>${item.category} • ${item.foodTiming || 'Anytime'}</span>
+                  <span>${escapeHtml(item.category)} • ${escapeHtml(item.foodTiming || 'Anytime')}</span>
                 </div>
               </div>
               <div class="text-[10px] text-teal-dark font-semibold bg-surface-subtle border border-surface-border px-2 py-1 rounded-lg shrink-0">
@@ -2870,7 +2908,7 @@
         document.getElementById('purchaseForm').reset();
         document.getElementById('purchaseEditId').value = '';
         document.getElementById('purchaseModalTitle').textContent = 'Record Medicine Purchase';
-        document.getElementById('purchaseDateField').value = new Date().toISOString().split('T')[0];
+        document.getElementById('purchaseDateField').value = todayDateKey();
         document.getElementById('purchaseItemsContainer').innerHTML = '';
         addPurchaseItemRow();
         document.getElementById('purchaseModal').classList.remove('hidden');
@@ -2902,7 +2940,7 @@
           btn.className = `w-full text-left p-3 rounded-xl border border-surface-border text-sm font-semibold flex items-center justify-between ${isAct ? 'bg-teal-subtle text-teal-primary' : 'bg-surface'}`;
           btn.dataset.memid = m.id;
           btn.innerHTML = `
-            <span>${m.name} (${m.relation})</span>
+            <span>${escapeHtml(m.name)} (${escapeHtml(m.relation)})</span>
             <i data-lucide="check" class="w-4 h-4 ${isAct ? '' : 'hidden'}"></i>
           `;
           container.appendChild(btn);
@@ -3049,7 +3087,7 @@
           schedules,
           currentStock: Number(document.getElementById('medFormStock').value) || 0,
           refillThresholdDays: Number(document.getElementById('medFormRefillDays').value) || 5,
-          createdDate: new Date().toISOString()
+          createdDate: ((AppState.medicines.find(x => x.id === id) || {}).createdDate) || new Date().toISOString()
         };
 
         await dbPut('MemberMedicines', med);
@@ -3179,7 +3217,7 @@
           document.getElementById('purchaseForm').reset();
           document.getElementById('purchaseEditId').value = '';
           document.getElementById('purchaseModalTitle').textContent = 'Record Medicine Purchase';
-          document.getElementById('purchaseDateField').value = new Date().toISOString().split('T')[0];
+          document.getElementById('purchaseDateField').value = todayDateKey();
           document.getElementById('purchaseItemsContainer').innerHTML = '';
           addPurchaseItemRow(medId, 150);
           document.getElementById('purchaseModal').classList.remove('hidden');
@@ -3288,7 +3326,7 @@
               row.innerHTML = `
                 <div>
                   <div class="font-bold text-charcoal">₹${it.price} for ${it.quantity} units</div>
-                  <div class="text-[10px] text-charcoal-muted">${pur ? pur.date : 'Recorded'} • ${pur ? pur.pharmacy : ''}</div>
+                  <div class="text-[10px] text-charcoal-muted">${escapeHtml(pur ? pur.date : 'Recorded')} • ${escapeHtml(pur ? pur.pharmacy : '')}</div>
                 </div>
                 <div class="text-[11px] font-semibold text-teal-primary">
                   ₹${(it.price / Math.max(1, it.quantity)).toFixed(1)}/unit
@@ -4070,4 +4108,4 @@
           </div>
         `;
       }
-    };
+    };
